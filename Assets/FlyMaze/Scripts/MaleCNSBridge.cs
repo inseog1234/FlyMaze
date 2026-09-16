@@ -32,7 +32,7 @@ namespace FlyMaze
     {
         [Header("MaleCNS v1.0 Runtime")]
         [SerializeField] private bool autoStart = true;
-        [SerializeField, Range(2f, 30f)] private float commandRateHz = 10f;
+        [SerializeField, Range(2f, 30f)] private float commandRateHz = 15f;
 
         public bool IsReady { get; private set; }
         public bool HasRuntimeData => File.Exists(GetWeightsPath()) && File.Exists(GetMetaPath());
@@ -45,6 +45,11 @@ namespace FlyMaze
         public long ConnectionCount { get; private set; }
         public float DNa02Left { get; private set; }
         public float DNa02Right { get; private set; }
+        public float DNa01Left { get; private set; }
+        public float DNa01Right { get; private set; }
+        public float ForwardLeft { get; private set; }
+        public float ForwardRight { get; private set; }
+        public MaleCNSSensoryFrame LatestSensoryFrame => _latestFrame;
 
         private readonly ConcurrentQueue<string> _stdout = new ConcurrentQueue<string>();
         private readonly ConcurrentQueue<string> _stderr = new ConcurrentQueue<string>();
@@ -168,6 +173,9 @@ namespace FlyMaze
             TurnOutput = 0f;
             EscapeOutput = 0f;
             LastSpikeCount = 0;
+            DNa02Left = DNa02Right = 0f;
+            DNa01Left = DNa01Right = 0f;
+            ForwardLeft = ForwardRight = 0f;
             if (IsReady)
                 SendRaw("R");
         }
@@ -245,9 +253,21 @@ namespace FlyMaze
                         ForwardOutput = Mathf.Clamp01(forward);
                         TurnOutput = Mathf.Clamp(turn, -1f, 1f);
                         LastSpikeCount = Mathf.Max(0, spikes);
-                        DNa02Left = Mathf.Max(0f, dLeft);
-                        DNa02Right = Mathf.Max(0f, dRight);
+                        DNa02Left = Mathf.Clamp01(dLeft);
+                        DNa02Right = Mathf.Clamp01(dRight);
                         EscapeOutput = Mathf.Clamp01(escape);
+
+                        if (parts.Length >= 11)
+                        {
+                            TryFloat(parts[7], out float d01Left);
+                            TryFloat(parts[8], out float d01Right);
+                            TryFloat(parts[9], out float fwdLeft);
+                            TryFloat(parts[10], out float fwdRight);
+                            DNa01Left = Mathf.Clamp01(d01Left);
+                            DNa01Right = Mathf.Clamp01(d01Right);
+                            ForwardLeft = Mathf.Clamp01(fwdLeft);
+                            ForwardRight = Mathf.Clamp01(fwdRight);
+                        }
                     }
                     continue;
                 }
