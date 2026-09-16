@@ -56,6 +56,7 @@ namespace FlyMaze
         private readonly List<WallVisual> _wallVisuals = new List<WallVisual>(512);
         private Material _floorMaterial;
         private Material _wallMaterial;
+        private Material _wallOutlineMaterial;
         private Material _startMaterial;
         private Material _goalMaterial;
 
@@ -256,10 +257,71 @@ namespace FlyMaze
 
             wall.transform.localScale = new Vector3(targetScale.x, 0.01f, targetScale.z);
             wall.GetComponent<Renderer>().sharedMaterial = _wallMaterial;
+            CreateWallOutline(wall.transform, targetScale);
 
             float normalized = (x + y) / Mathf.Max(1f, settings.width + settings.height - 2f);
             float delay = normalized * 0.24f + UnityEngine.Random.Range(0f, 0.025f);
             _wallVisuals.Add(new WallVisual(wall.transform, targetScale, delay));
+        }
+
+        private void CreateWallOutline(Transform wall, Vector3 targetScale)
+        {
+            if (wall == null || _wallOutlineMaterial == null)
+                return;
+
+            // The outline is built as thin child cubes around all twelve box edges. Because they
+            // are children of the animated wall, the edge cage rises together with the wall and
+            // makes its real 3D height readable from the tilted orthographic camera.
+            const float edgeWorld = 0.035f;
+            const float edgeLift = 0.006f;
+
+            float tx = edgeWorld / Mathf.Max(0.001f, targetScale.x);
+            float ty = edgeWorld / Mathf.Max(0.001f, targetScale.y);
+            float tz = edgeWorld / Mathf.Max(0.001f, targetScale.z);
+            float lx = 1f + tx * 1.8f;
+            float lz = 1f + tz * 1.8f;
+
+            Transform root = new GameObject("Wall Outline").transform;
+            root.SetParent(wall, false);
+
+            for (int sy = -1; sy <= 1; sy += 2)
+            for (int sz = -1; sz <= 1; sz += 2)
+            {
+                Vector3 pos = new Vector3(0f, sy * (0.5f + edgeLift / targetScale.y), sz * 0.5f);
+                CreateOutlineEdge(root, pos, new Vector3(lx, ty, tz));
+            }
+
+            for (int sy = -1; sy <= 1; sy += 2)
+            for (int sx = -1; sx <= 1; sx += 2)
+            {
+                Vector3 pos = new Vector3(sx * 0.5f, sy * (0.5f + edgeLift / targetScale.y), 0f);
+                CreateOutlineEdge(root, pos, new Vector3(tx, ty, lz));
+            }
+
+            for (int sx = -1; sx <= 1; sx += 2)
+            for (int sz = -1; sz <= 1; sz += 2)
+            {
+                Vector3 pos = new Vector3(sx * 0.5f, 0f, sz * 0.5f);
+                CreateOutlineEdge(root, pos, new Vector3(tx, 1.02f, tz));
+            }
+        }
+
+        private void CreateOutlineEdge(Transform parent, Vector3 localPosition, Vector3 localScale)
+        {
+            GameObject edge = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            edge.name = "Edge";
+            edge.transform.SetParent(parent, false);
+            edge.transform.localPosition = localPosition;
+            edge.transform.localRotation = Quaternion.identity;
+            edge.transform.localScale = localScale;
+
+            Collider collider = edge.GetComponent<Collider>();
+            if (collider != null)
+                collider.enabled = false;
+
+            Renderer renderer = edge.GetComponent<Renderer>();
+            if (renderer != null)
+                renderer.sharedMaterial = _wallOutlineMaterial;
         }
 
         private void CreateMarker(string markerName, Vector3 position, float cellSize, Material material)
@@ -350,6 +412,7 @@ namespace FlyMaze
         {
             _floorMaterial = MakeMaterial("Maze Floor Material", new Color(0.028f, 0.036f, 0.055f), Color.black);
             _wallMaterial = MakeMaterial("Maze Wall Material", new Color(0.10f, 0.16f, 0.22f), new Color(0.02f, 0.14f, 0.19f));
+            _wallOutlineMaterial = MakeMaterial("Maze Wall Outline", new Color(0.19f, 0.34f, 0.43f), new Color(0.035f, 0.20f, 0.24f));
             _startMaterial = MakeMaterial("Start Material", new Color(0.12f, 0.92f, 0.76f), new Color(0.06f, 0.75f, 0.58f));
             _goalMaterial = MakeMaterial("Goal Material", new Color(1.00f, 0.42f, 0.62f), new Color(0.85f, 0.12f, 0.36f));
         }
@@ -384,11 +447,13 @@ namespace FlyMaze
         {
             DestroyMaterial(_floorMaterial);
             DestroyMaterial(_wallMaterial);
+            DestroyMaterial(_wallOutlineMaterial);
             DestroyMaterial(_startMaterial);
             DestroyMaterial(_goalMaterial);
 
             _floorMaterial = null;
             _wallMaterial = null;
+            _wallOutlineMaterial = null;
             _startMaterial = null;
             _goalMaterial = null;
         }
