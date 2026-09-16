@@ -256,8 +256,6 @@ namespace FlyMaze
                 ? Mathf.Clamp(((rightSignal - leftSignal) / (sum + 0.0001f)) * 1.8f, -1f, 1f)
                 : 0f;
 
-            // The graph is only an environmental odor-diffusion model. No path, waypoint or
-            // scripted turn is sent to the motor controller; MaleCNS receives bilateral local cues.
             _brain.SubmitSensory(new MaleCNSSensoryFrame(
                 VisionFront, VisionLeft, VisionRight, bearing, totalSignal, targetKind));
 
@@ -330,7 +328,6 @@ namespace FlyMaze
                     int index = GridIndex(x, y);
                     Vector3 center = GridCellWorld(x, y) + Vector3.up * sensorHeight;
 
-                    // North and east are enough; the reciprocal bit is written at the same time.
                     for (int dir = 0; dir < 2; dir++)
                     {
                         int nx = x + GridDx[dir];
@@ -373,7 +370,7 @@ namespace FlyMaze
                     if (cell >= 0 && !sourceCells.Contains(cell))
                         sourceCells.Add(cell);
 
-                    signature = signature * 31 + food.GetInstanceID();
+                    signature = signature * 31 + i;
                     signature = signature * 31 + cell;
 
                     float sqr = (food.transform.position - transform.position).sqrMagnitude;
