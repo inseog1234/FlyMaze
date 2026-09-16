@@ -9,20 +9,21 @@ namespace FlyMaze
     public sealed class MazeCameraController : MonoBehaviour
     {
         [Header("Zoom")]
-        [SerializeField] private float zoomSpeed = 0.0016f;
+        [SerializeField] private float zoomSpeed = 0.0032f;
         [SerializeField] private float minOrthographicSize = 2.5f;
         [SerializeField] private float maxOrthographicSize = 90f;
 
         [Header("UI Safe Area")]
         [SerializeField, Range(0f, 0.45f)] private float reservedLeftViewport = 0.27f;
         [SerializeField, Range(0f, 0.20f)] private float reservedRightViewport = 0.03f;
-        [SerializeField, Range(0f, 0.20f)] private float reservedTopViewport = 0.05f;
+        [SerializeField, Range(0f, 0.20f)] private float reservedTopViewport = 0.10f;
         [SerializeField, Range(0f, 0.20f)] private float reservedBottomViewport = 0.05f;
 
         private readonly Plane _groundPlane = new Plane(Vector3.up, Vector3.zero);
 
         private Camera _camera;
         private RandomMazeGenerator _generator;
+        private FoodPlacementController _foodPlacement;
         private bool _framePending;
 
         private Vector3 _homePosition;
@@ -38,25 +39,27 @@ namespace FlyMaze
             _camera = GetComponent<Camera>();
         }
 
-        public void Bind(RandomMazeGenerator generator)
+        public void Bind(RandomMazeGenerator generator, FoodPlacementController foodPlacement = null)
         {
-            if (_generator == generator)
-                return;
-
-            if (_generator != null)
+            if (_generator != generator)
             {
-                _generator.GenerationStarted -= HandleGenerationStarted;
-                _generator.MazeBuilt -= HandleMazeBuilt;
+                if (_generator != null)
+                {
+                    _generator.GenerationStarted -= HandleGenerationStarted;
+                    _generator.MazeBuilt -= HandleMazeBuilt;
+                }
+
+                _generator = generator;
+
+                if (_generator != null)
+                {
+                    _generator.GenerationStarted += HandleGenerationStarted;
+                    _generator.MazeBuilt += HandleMazeBuilt;
+                    _framePending = true;
+                }
             }
 
-            _generator = generator;
-
-            if (_generator != null)
-            {
-                _generator.GenerationStarted += HandleGenerationStarted;
-                _generator.MazeBuilt += HandleMazeBuilt;
-                _framePending = true;
-            }
+            _foodPlacement = foodPlacement;
         }
 
         private void HandleGenerationStarted()
@@ -67,8 +70,6 @@ namespace FlyMaze
 
         private void HandleMazeBuilt(MazeBuildInfo _)
         {
-            // Retry after generation as a safety net in case the maze hierarchy was not ready
-            // during the first LateUpdate of the generation frame.
             _framePending = true;
         }
 
@@ -85,6 +86,7 @@ namespace FlyMaze
                 return;
 
             bool pointerOverUi = EventSystem.current != null && EventSystem.current.IsPointerOverGameObject();
+            bool manualPlacement = _foodPlacement != null && _foodPlacement.ManualPlacementActive;
             Vector2 screenPosition = mouse.position.ReadValue();
 
             float scroll = mouse.scroll.ReadValue().y;
@@ -97,7 +99,7 @@ namespace FlyMaze
                     BeginDrag(1, screenPosition);
                 else if (mouse.rightButton.wasPressedThisFrame)
                     BeginDrag(2, screenPosition);
-                else if (!pointerOverUi && mouse.leftButton.wasPressedThisFrame)
+                else if (!pointerOverUi && !manualPlacement && mouse.leftButton.wasPressedThisFrame)
                     BeginDrag(0, screenPosition);
             }
 
@@ -117,8 +119,6 @@ namespace FlyMaze
                 }
                 else if (TryGetGroundPoint(screenPosition, out Vector3 currentPoint))
                 {
-                    // Keep the original ground point under the cursor. Moving the camera by the
-                    // difference produces a direct map-style grab/pan without a magic speed value.
                     transform.position += _dragAnchor - currentPoint;
                 }
             }
@@ -145,7 +145,6 @@ namespace FlyMaze
                 minOrthographicSize,
                 maxOrthographicSize);
 
-            // Zoom toward the mouse cursor instead of the center of the screen.
             if (hasBefore && TryGetGroundPoint(screenPosition, out Vector3 after))
                 transform.position += before - after;
         }
@@ -189,8 +188,6 @@ namespace FlyMaze
         {
             _camera.orthographic = true;
 
-            // The generator already establishes the isometric viewing rotation. We preserve it and
-            // calculate an exact orthographic fit in camera space while reserving the left HUD area.
             Vector3 center = new Vector3(bounds.center.x, 0f, bounds.center.z);
             Vector3 right = transform.right;
             Vector3 up = transform.up;
