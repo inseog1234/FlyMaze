@@ -32,7 +32,7 @@ namespace FlyMaze
     {
         [Header("MaleCNS v1.0 Runtime")]
         [SerializeField] private bool autoStart = true;
-        [SerializeField, Range(2f, 30f)] private float commandRateHz = 15f;
+        [SerializeField, Range(2f, 30f)] private float commandRateHz = 12f;
 
         public bool IsReady { get; private set; }
         public bool HasRuntimeData => File.Exists(GetWeightsPath()) && File.Exists(GetMetaPath());
@@ -49,6 +49,11 @@ namespace FlyMaze
         public float DNa01Right { get; private set; }
         public float ForwardLeft { get; private set; }
         public float ForwardRight { get; private set; }
+        public float PamActivity { get; private set; }
+        public float Ppl1Activity { get; private set; }
+        public float LastRewardPulse { get; private set; }
+        public float LastPunishmentPulse { get; private set; }
+        public int ReinforcementEventCount { get; private set; }
         public MaleCNSSensoryFrame LatestSensoryFrame => _latestFrame;
 
         private readonly ConcurrentQueue<string> _stdout = new ConcurrentQueue<string>();
@@ -59,6 +64,8 @@ namespace FlyMaze
         private bool _hasFrame;
         private float _nextCommandTime;
         private bool _quitting;
+        private float _rewardDisplayUntil;
+        private float _punishmentDisplayUntil;
 
         private static readonly CultureInfo Invariant = CultureInfo.InvariantCulture;
 
@@ -71,6 +78,11 @@ namespace FlyMaze
         private void Update()
         {
             DrainProcessOutput();
+
+            if (Time.unscaledTime > _rewardDisplayUntil)
+                LastRewardPulse = 0f;
+            if (Time.unscaledTime > _punishmentDisplayUntil)
+                LastPunishmentPulse = 0f;
 
             if (!IsReady || _process == null || _process.HasExited || !_hasFrame)
                 return;
@@ -86,6 +98,32 @@ namespace FlyMaze
         {
             _latestFrame = frame;
             _hasFrame = true;
+        }
+
+        public void GiveReward(float amount = 1f)
+        {
+            amount = Mathf.Clamp(amount, 0f, 2f);
+            if (amount <= 0f)
+                return;
+
+            LastRewardPulse = amount;
+            _rewardDisplayUntil = Time.unscaledTime + 1.1f;
+            ReinforcementEventCount++;
+            if (IsReady)
+                SendRaw("E|" + amount.ToString("0.0000", Invariant) + "|0.0000");
+        }
+
+        public void GivePunishment(float amount = 1f)
+        {
+            amount = Mathf.Clamp(amount, 0f, 2f);
+            if (amount <= 0f)
+                return;
+
+            LastPunishmentPulse = amount;
+            _punishmentDisplayUntil = Time.unscaledTime + 1.1f;
+            ReinforcementEventCount++;
+            if (IsReady)
+                SendRaw("E|0.0000|" + amount.ToString("0.0000", Invariant));
         }
 
         public void StartRuntime()
@@ -176,6 +214,8 @@ namespace FlyMaze
             DNa02Left = DNa02Right = 0f;
             DNa01Left = DNa01Right = 0f;
             ForwardLeft = ForwardRight = 0f;
+            PamActivity = Ppl1Activity = 0f;
+            LastRewardPulse = LastPunishmentPulse = 0f;
             if (IsReady)
                 SendRaw("R");
         }
@@ -241,32 +281,36 @@ namespace FlyMaze
                 if (line.StartsWith("M|", StringComparison.Ordinal))
                 {
                     string[] parts = line.Split('|');
-                    if (parts.Length >= 7)
+                    if (parts.Length >= 11)
                     {
                         TryFloat(parts[1], out float forward);
                         TryFloat(parts[2], out float turn);
                         int.TryParse(parts[3], NumberStyles.Integer, Invariant, out int spikes);
-                        TryFloat(parts[4], out float dLeft);
-                        TryFloat(parts[5], out float dRight);
+                        TryFloat(parts[4], out float d02Left);
+                        TryFloat(parts[5], out float d02Right);
                         TryFloat(parts[6], out float escape);
+                        TryFloat(parts[7], out float d01Left);
+                        TryFloat(parts[8], out float d01Right);
+                        TryFloat(parts[9], out float forwardLeft);
+                        TryFloat(parts[10], out float forwardRight);
 
                         ForwardOutput = Mathf.Clamp01(forward);
                         TurnOutput = Mathf.Clamp(turn, -1f, 1f);
                         LastSpikeCount = Mathf.Max(0, spikes);
-                        DNa02Left = Mathf.Clamp01(dLeft);
-                        DNa02Right = Mathf.Clamp01(dRight);
+                        DNa02Left = Mathf.Max(0f, d02Left);
+                        DNa02Right = Mathf.Max(0f, d02Right);
+                        DNa01Left = Mathf.Max(0f, d01Left);
+                        DNa01Right = Mathf.Max(0f, d01Right);
+                        ForwardLeft = Mathf.Max(0f, forwardLeft);
+                        ForwardRight = Mathf.Max(0f, forwardRight);
                         EscapeOutput = Mathf.Clamp01(escape);
 
-                        if (parts.Length >= 11)
+                        if (parts.Length >= 13)
                         {
-                            TryFloat(parts[7], out float d01Left);
-                            TryFloat(parts[8], out float d01Right);
-                            TryFloat(parts[9], out float fwdLeft);
-                            TryFloat(parts[10], out float fwdRight);
-                            DNa01Left = Mathf.Clamp01(d01Left);
-                            DNa01Right = Mathf.Clamp01(d01Right);
-                            ForwardLeft = Mathf.Clamp01(fwdLeft);
-                            ForwardRight = Mathf.Clamp01(fwdRight);
+                            TryFloat(parts[11], out float pam);
+                            TryFloat(parts[12], out float ppl1);
+                            PamActivity = Mathf.Clamp01(pam);
+                            Ppl1Activity = Mathf.Clamp01(ppl1);
                         }
                     }
                     continue;
