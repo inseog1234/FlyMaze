@@ -7,21 +7,27 @@ namespace FlyMaze
     {
         private void Awake()
         {
-            EnsureCamera();
+            Camera camera = EnsureCamera();
             EnsureLighting();
 
             RandomMazeGenerator generator = GetComponent<RandomMazeGenerator>();
             if (generator == null)
                 generator = gameObject.AddComponent<RandomMazeGenerator>();
 
+            MazeCameraController cameraController = camera.GetComponent<MazeCameraController>();
+            if (cameraController == null)
+                cameraController = camera.gameObject.AddComponent<MazeCameraController>();
+            cameraController.Bind(generator);
+
             MazeSetupUI ui = GetComponent<MazeSetupUI>();
             if (ui == null)
                 ui = gameObject.AddComponent<MazeSetupUI>();
 
             ui.Initialize(generator);
+            HudTextQuality.Apply(transform);
         }
 
-        private static void EnsureCamera()
+        private static Camera EnsureCamera()
         {
             Camera camera = Camera.main;
             if (camera == null)
@@ -36,6 +42,7 @@ namespace FlyMaze
             camera.nearClipPlane = 0.1f;
             camera.farClipPlane = 500f;
             camera.allowHDR = true;
+            return camera;
         }
 
         private static void EnsureLighting()
