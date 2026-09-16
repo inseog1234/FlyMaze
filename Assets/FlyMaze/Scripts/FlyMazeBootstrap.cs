@@ -24,6 +24,12 @@ namespace FlyMaze
                 cameraController = camera.gameObject.AddComponent<MazeCameraController>();
             cameraController.Bind(generator, foodPlacement);
 
+            MaleCNSBridge brain = GetComponent<MaleCNSBridge>();
+            if (brain == null)
+                brain = gameObject.AddComponent<MaleCNSBridge>();
+
+            MaleCNSFlyAgent flyAgent = EnsureFlyAgent(generator, foodPlacement, brain);
+
             MazeSetupUI ui = GetComponent<MazeSetupUI>();
             if (ui == null)
                 ui = gameObject.AddComponent<MazeSetupUI>();
@@ -34,7 +40,31 @@ namespace FlyMaze
                 foodUi = gameObject.AddComponent<FoodPlacementUI>();
             foodUi.Initialize(foodPlacement);
 
+            MaleCNSStatusUI brainUi = GetComponent<MaleCNSStatusUI>();
+            if (brainUi == null)
+                brainUi = gameObject.AddComponent<MaleCNSStatusUI>();
+            brainUi.Initialize(brain, flyAgent);
+
             HudTextQuality.Apply(transform);
+        }
+
+        private MaleCNSFlyAgent EnsureFlyAgent(RandomMazeGenerator generator, FoodPlacementController foodPlacement, MaleCNSBridge brain)
+        {
+            Transform existing = transform.Find("MaleCNS Fly Agent");
+            GameObject fly = existing != null ? existing.gameObject : new GameObject("MaleCNS Fly Agent");
+            if (existing == null)
+                fly.transform.SetParent(transform, false);
+
+            if (fly.GetComponent<Rigidbody>() == null)
+                fly.AddComponent<Rigidbody>();
+            if (fly.GetComponent<SphereCollider>() == null)
+                fly.AddComponent<SphereCollider>();
+
+            MaleCNSFlyAgent agent = fly.GetComponent<MaleCNSFlyAgent>();
+            if (agent == null)
+                agent = fly.AddComponent<MaleCNSFlyAgent>();
+            agent.Initialize(generator, foodPlacement, brain);
+            return agent;
         }
 
         private static Camera EnsureCamera()
