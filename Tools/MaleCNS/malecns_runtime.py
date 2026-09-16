@@ -8,8 +8,9 @@ Persistent learning is an explicit modeling layer: recent Kenyon-cell activity f
 eligibility trace, PAM/PPL1 dopamine events gate depression of KC->MBON synapses in MBONs
 most strongly associated with the corresponding DAN population, and the resulting delta
 weights are saved under Library/MaleCNS/kc_mbon_plasticity_v1.npz across Play sessions.
-The MaleCNS wiring/neuron identities are real dataset values; the LIF dynamics and plasticity
-rule are engineering choices for this interactive experiment, not measured biophysics.
+The MaleCNS wiring/neuron identities are real dataset values; the LIF dynamics, hunger drive,
+sensory encoding, and plasticity rule are engineering choices for this interactive experiment,
+not measured biophysics.
 """
 from __future__ import annotations
 
@@ -38,6 +39,12 @@ class MaleCNSRuntime:
     MAX_DEPRESSION = np.float32(0.68)
     MAX_EDGES_PER_MBON_EVENT = 96
 
+    HUNGER_RECOVERY_PER_COMMAND = 0.018
+    HUNGER_AFTER_FOOD = 0.58
+    HUNGER_SENSORY_GAIN_MIN = 1.65
+    HUNGER_SENSORY_GAIN_MAX = 4.35
+    HUNGER_FOOD_SIGNAL_FLOOR = 0.34
+
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
         weights_path = data_dir / "malecns_weights.npz"
@@ -57,6 +64,7 @@ class MaleCNSRuntime:
             if key.startswith("group_")
         }
         self._ensure_annotation_groups()
+        self._disable_recurrent_input_into_sensory_neurons()
 
         self.v = np.zeros(self.n, np.float32)
         self.spikes = np.zeros(self.n, np.float32)
@@ -71,6 +79,7 @@ class MaleCNSRuntime:
         self.punishment_pulse = 0.0
         self.pam_ema = 0.0
         self.ppl1_ema = 0.0
+        self.hunger = 1.0
 
         self.kc_idx = self.groups.get("kc", np.empty(0, np.int32))
         self.mbon_idx = self.groups.get("mbon", np.empty(0, np.int32))
@@ -86,6 +95,23 @@ class MaleCNSRuntime:
         self.reward_mbon_rows = np.empty(0, np.int32)
         self.punish_mbon_rows = np.empty(0, np.int32)
         self._prepare_plasticity()
+
+    def _disable_recurrent_input_into_sensory_neurons(self):
+        """Block network feedback *into* sensory neurons while preserving their outgoing synapses.
+
+        Previously FlyMaze reset all sensory voltages to zero every 20 ms before stimulus injection.
+        Large ORN populations then received sub-threshold input that was erased before it could
+        integrate and spike. The HUD could show a strong odor while the connectome barely received it.
+
+        Zeroing rows of W is the intended operation: sensory neurons no longer receive recurrent
+        synaptic feedback, but game sensory current can accumulate across time and generate spikes.
+        """
+        sensory = self.groups.get("sensory", np.empty(0, np.int32))
+        if len(sensory) == 0:
+            return
+        row_gate = np.ones(self.n, np.float32)
+        row_gate[sensory] = 0.0
+        self.W = sparse.diags(row_gate, format="csr").dot(self.W).tocsr()
 
     def _ensure_annotation_groups(self):
         need = any(len(self.groups.get(name, ())) == 0 for name in ("reward_dan", "punish_dan", "kc", "mbon"))
@@ -330,6 +356,7 @@ class MaleCNSRuntime:
         self.punishment_pulse = 0.0
         self.pam_ema = 0.0
         self.ppl1_ema = 0.0
+        self.hunger = 1.0
         # Persistent KC->MBON deltas intentionally survive Reset and Play sessions.
 
     def reinforce(self, reward: float, punishment: float):
@@ -338,6 +365,7 @@ class MaleCNSRuntime:
         self.reward_pulse = max(self.reward_pulse, reward)
         self.punishment_pulse = max(self.punishment_pulse, punishment)
         if reward > 0:
+            self.hunger = max(self.HUNGER_AFTER_FOOD, self.hunger - 0.28 * reward)
             self._apply_plasticity(self.reward_mbon_rows, reward)
         if punishment > 0:
             self._apply_plasticity(self.punish_mbon_rows, punishment)
@@ -371,6 +399,11 @@ class MaleCNSRuntime:
         target_bearing = float(np.clip(target_bearing, -1.0, 1.0))
         target_strength = float(np.clip(target_strength, 0.0, 1.0))
 
+        if target_kind == 0:
+            self.hunger = min(1.0, self.hunger + self.HUNGER_RECOVERY_PER_COMMAND)
+        else:
+            self.hunger = max(0.0, self.hunger - 0.004)
+
         total_spikes = 0
         d02_l = d02_r = d01_l = d01_r = 0.0
         fwd_l_out = fwd_r_out = 0.0
@@ -389,10 +422,8 @@ class MaleCNSRuntime:
             noise_mask = self.rng.random(self.n) < self.noise_probability
             self.v[noise_mask] += self.noise_amplitude
 
-            sensory = self.groups.get("sensory")
-            if sensory is not None and len(sensory):
-                self.v[sensory] = 0.0
-
+            # Do not zero sensory voltages here. Recurrent input to sensory neurons was removed
+            # from W once at startup, so injected visual/olfactory current can integrate normally.
             self._stim("loom_L", 1.22 * left + 0.78 * front)
             self._stim("loom_R", 1.22 * right + 0.78 * front)
 
@@ -400,8 +431,15 @@ class MaleCNSRuntime:
             right_bias = max(0.0, target_bearing)
             center = 1.0 - abs(target_bearing)
             if target_kind == 0:
-                self._stim("food_L", target_strength * (0.24 + 1.05 * left_bias + 0.20 * center))
-                self._stim("food_R", target_strength * (0.24 + 1.05 * right_bias + 0.20 * center))
+                hunger_gain = self.HUNGER_SENSORY_GAIN_MIN + (
+                    self.HUNGER_SENSORY_GAIN_MAX - self.HUNGER_SENSORY_GAIN_MIN
+                ) * self.hunger
+                food_drive = max(
+                    target_strength,
+                    self.HUNGER_FOOD_SIGNAL_FLOOR * self.hunger,
+                ) * hunger_gain
+                self._stim("food_L", food_drive * (0.48 + 1.72 * left_bias + 0.24 * center))
+                self._stim("food_R", food_drive * (0.48 + 1.72 * right_bias + 0.24 * center))
             elif target_kind == 1:
                 self._stim("goal_L", target_strength * (0.22 + 0.95 * left_bias + 0.18 * center))
                 self._stim("goal_R", target_strength * (0.22 + 0.95 * right_bias + 0.18 * center))
