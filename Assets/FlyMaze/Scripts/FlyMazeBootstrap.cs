@@ -45,8 +45,16 @@ namespace FlyMaze
                 brainUi = gameObject.AddComponent<MaleCNSStatusUI>();
             brainUi.Initialize(brain, flyAgent);
 
-            // The old corner badge duplicated information already shown by the neural monitor.
-            // Hide it so every remaining functional HUD surface uses the same window interaction.
+            MaleCNSLearningUI learningUi = GetComponent<MaleCNSLearningUI>();
+            if (learningUi == null)
+                learningUi = gameObject.AddComponent<MaleCNSLearningUI>();
+            learningUi.Initialize(brain);
+
+            MaleCNSAutoSetupUI setupUi = GetComponent<MaleCNSAutoSetupUI>();
+            if (setupUi == null)
+                setupUi = gameObject.AddComponent<MaleCNSAutoSetupUI>();
+            setupUi.Initialize(brain);
+
             GameObject liveBadge = GameObject.Find("Live Badge");
             if (liveBadge != null)
                 liveBadge.SetActive(false);
@@ -54,6 +62,7 @@ namespace FlyMaze
             HudWindowController.AttachNamed("Setup Panel", "MAP SETUP");
             HudWindowController.AttachNamed("Food Objective Bar", "FOOD OBJECTIVES");
             HudWindowController.AttachNamed("MaleCNS Neural Monitor", "MALECNS NEURAL MONITOR");
+            HudWindowController.AttachNamed("MaleCNS Learning Panel", "LEARNING / PLASTICITY");
 
             HudTextQuality.Apply(transform);
         }

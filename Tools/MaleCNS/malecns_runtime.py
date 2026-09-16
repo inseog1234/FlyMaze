@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
-"""Line-oriented MaleCNS v1.0 simulation bridge for FlyMaze.
+"""MaleCNS v1.0 runtime bridge for FlyMaze.
 
-Protocol (stdin -> stdout):
-  S|front|left|right|lateralSensoryBias|sensoryStrength|targetKind
-  E|reward|punishment
-  R
-  Q
+Unity sends only local sensory signals and reinforcement events. No maze route, waypoint,
+A*, BFS, or scripted turn is supplied to the connectome.
 
-The Unity side does not provide a maze route or waypoint. It provides only local wall/looming
-signals and left-vs-right odor/goal sensory bias. Motor output is decoded from MaleCNS
-descending neurons.
-
-Reward injects a pulse into identified PAM11 dopamine neurons; punishment injects a pulse into
-identified PPL101/PPL1 dopamine neurons. These are engineered reinforcement events applied to
-real MaleCNS neuron identities. This runtime does not claim that chemical concentration or
-biophysical dopamine release is being reproduced.
+Persistent learning is an explicit modeling layer: recent Kenyon-cell activity forms an
+eligibility trace, PAM/PPL1 dopamine events gate depression of KC->MBON synapses in MBONs
+most strongly associated with the corresponding DAN population, and the resulting delta
+weights are saved under Library/MaleCNS/kc_mbon_plasticity_v1.npz across Play sessions.
+The MaleCNS wiring/neuron identities are real dataset values; the LIF dynamics and plasticity
+rule are engineering choices for this interactive experiment, not measured biophysics.
 """
 from __future__ import annotations
 
@@ -37,13 +32,19 @@ class MaleCNSRuntime:
     THRESHOLD = np.float32(1.0)
     REST_VOLTAGE = np.float32(0.63)
 
+    ELIGIBILITY_DECAY = np.float32(0.965)
+    ELIGIBILITY_MIN = np.float32(0.06)
+    LEARNING_RATE = np.float32(0.085)
+    MAX_DEPRESSION = np.float32(0.68)
+    MAX_EDGES_PER_MBON_EVENT = 96
+
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
         weights_path = data_dir / "malecns_weights.npz"
         meta_path = data_dir / "malecns_meta.npz"
         if not weights_path.exists() or not meta_path.exists():
             raise FileNotFoundError(
-                f"MaleCNS cache missing in {data_dir}. Run Tools/MaleCNS/setup-malecns.ps1 first."
+                f"MaleCNS cache missing in {data_dir}. Run setup once first."
             )
 
         self.W = sparse.load_npz(weights_path).tocsr().astype(np.float32)
@@ -55,7 +56,7 @@ class MaleCNSRuntime:
             for key in meta.files
             if key.startswith("group_")
         }
-        self._ensure_reinforcement_groups()
+        self._ensure_annotation_groups()
 
         self.v = np.zeros(self.n, np.float32)
         self.spikes = np.zeros(self.n, np.float32)
@@ -71,16 +72,32 @@ class MaleCNSRuntime:
         self.pam_ema = 0.0
         self.ppl1_ema = 0.0
 
-    def _ensure_reinforcement_groups(self):
-        if len(self.groups.get("reward_dan", ())) and len(self.groups.get("punish_dan", ())):
+        self.kc_idx = self.groups.get("kc", np.empty(0, np.int32))
+        self.mbon_idx = self.groups.get("mbon", np.empty(0, np.int32))
+        self.kc_mask = np.zeros(self.n, dtype=bool)
+        if len(self.kc_idx):
+            self.kc_mask[self.kc_idx] = True
+        self.kc_eligibility = np.zeros(self.n, np.float32)
+
+        self.plasticity_path = self.data_dir / "kc_mbon_plasticity_v1.npz"
+        self.kc_mbon_base = sparse.csr_matrix((len(self.mbon_idx), self.n), dtype=np.float32)
+        self.plastic_matrix = sparse.csr_matrix((len(self.mbon_idx), self.n), dtype=np.float32)
+        self.plastic_changes: dict[tuple[int, int], float] = {}
+        self.reward_mbon_rows = np.empty(0, np.int32)
+        self.punish_mbon_rows = np.empty(0, np.int32)
+        self._prepare_plasticity()
+
+    def _ensure_annotation_groups(self):
+        need = any(len(self.groups.get(name, ())) == 0 for name in ("reward_dan", "punish_dan", "kc", "mbon"))
+        if not need:
             return
 
         raw = self.data_dir / "raw"
         annotation = raw / "body-annotations-male-cns-v1.0-minconf-0.5.feather"
         neurotransmitters = raw / "body-neurotransmitters-male-cns-v1.0.feather"
         if not annotation.exists() or not neurotransmitters.exists():
-            self.groups.setdefault("reward_dan", np.empty(0, np.int32))
-            self.groups.setdefault("punish_dan", np.empty(0, np.int32))
+            for name in ("reward_dan", "punish_dan", "kc", "mbon"):
+                self.groups.setdefault(name, np.empty(0, np.int32))
             return
 
         ann = feather.read_table(annotation).to_pandas()
@@ -88,32 +105,40 @@ class MaleCNSRuntime:
         if "bodyId" not in ann.columns:
             return
 
-        flywire = ann["flywireType"].fillna("").astype(str) if "flywireType" in ann.columns else ""
-        fallback = ann["type"].fillna("").astype(str) if "type" in ann.columns else ""
-        instance = ann["instance"].fillna("").astype(str) if "instance" in ann.columns else ""
-        if isinstance(flywire, str):
-            labels = fallback if not isinstance(fallback, str) else instance
+        label_columns = []
+        for name in ("flywireType", "type", "instance", "class", "subclass", "superclass"):
+            if name in ann.columns:
+                label_columns.append(ann[name].fillna("").astype(str).str.upper())
+
+        if label_columns:
+            combined = label_columns[0].copy()
+            for series in label_columns[1:]:
+                combined = combined + "|" + series
         else:
-            labels = flywire.copy()
-            if not isinstance(fallback, str):
-                labels = labels.where(labels.ne(""), fallback)
-            if not isinstance(instance, str):
-                labels = labels.where(labels.ne(""), instance)
-        labels = labels.fillna("").astype(str).str.upper()
+            combined = ann["bodyId"].astype(str)
 
         nt_map = nt.drop_duplicates("body").set_index("body")["consensus_nt"].fillna("").astype(str).str.lower()
         ann_nt = ann["bodyId"].map(nt_map).fillna("").astype(str).str.lower()
         dopamine = ann_nt.eq("dopamine")
 
-        reward_mask = dopamine & labels.str.contains("PAM11", regex=False)
-        punish_mask = dopamine & labels.str.contains("PPL101", regex=False)
+        reward_mask = dopamine & combined.str.contains("PAM11", regex=False)
+        punish_mask = dopamine & combined.str.contains("PPL101", regex=False)
         if not reward_mask.any():
-            reward_mask = dopamine & labels.str.startswith("PAM")
+            reward_mask = dopamine & combined.str.contains("PAM", regex=False)
         if not punish_mask.any():
-            punish_mask = dopamine & labels.str.startswith("PPL1")
+            punish_mask = dopamine & combined.str.contains("PPL1", regex=False)
+
+        kc_mask = combined.str.contains("KENYON", regex=False)
+        kc_mask |= combined.str.contains("|KC", regex=False)
+        kc_mask |= combined.str.startswith("KC")
+
+        mbon_mask = combined.str.contains("MBON", regex=False)
+        mbon_mask |= combined.str.contains("MUSHROOM BODY OUTPUT", regex=False)
 
         self.groups["reward_dan"] = self._body_ids_to_indices(ann.loc[reward_mask, "bodyId"].to_numpy(np.int64))
         self.groups["punish_dan"] = self._body_ids_to_indices(ann.loc[punish_mask, "bodyId"].to_numpy(np.int64))
+        self.groups["kc"] = self._body_ids_to_indices(ann.loc[kc_mask, "bodyId"].to_numpy(np.int64))
+        self.groups["mbon"] = self._body_ids_to_indices(ann.loc[mbon_mask, "bodyId"].to_numpy(np.int64))
 
     def _body_ids_to_indices(self, body_ids: np.ndarray) -> np.ndarray:
         if len(body_ids) == 0:
@@ -124,9 +149,180 @@ class MaleCNSRuntime:
         valid &= self.ids[safe] == body_ids
         return np.unique(pos[valid].astype(np.int32))
 
+    def _prepare_plasticity(self):
+        if len(self.kc_idx) == 0 or len(self.mbon_idx) == 0:
+            print("LEARNING|0|0|KC_OR_MBON_GROUP_MISSING", flush=True)
+            return
+
+        base_rows = self.W[self.mbon_idx, :].tocsr()
+        coo = base_rows.tocoo()
+        keep = self.kc_mask[coo.col] & (coo.data > 0)
+        self.kc_mbon_base = sparse.csr_matrix(
+            (coo.data[keep].astype(np.float32), (coo.row[keep], coo.col[keep])),
+            shape=base_rows.shape,
+            dtype=np.float32,
+        )
+        self.kc_mbon_base.sum_duplicates()
+
+        self.reward_mbon_rows = self._dan_target_rows("reward_dan")
+        self.punish_mbon_rows = self._dan_target_rows("punish_dan")
+        self._load_plasticity()
+        print(
+            f"LEARNING|{len(self.kc_idx)}|{len(self.mbon_idx)}|{self.kc_mbon_base.nnz}|"
+            f"{len(self.reward_mbon_rows)}|{len(self.punish_mbon_rows)}|{len(self.plastic_changes)}",
+            flush=True,
+        )
+
+    def _dan_target_rows(self, group: str) -> np.ndarray:
+        if len(self.mbon_idx) == 0:
+            return np.empty(0, np.int32)
+        dan = self.groups.get(group, np.empty(0, np.int32))
+        if len(dan) == 0:
+            return np.arange(len(self.mbon_idx), dtype=np.int32)
+
+        sub = self.W[self.mbon_idx, :][:, dan]
+        drive = np.asarray(np.abs(sub).sum(axis=1)).ravel()
+        positive = np.flatnonzero(drive > 0)
+        if len(positive) == 0:
+            return np.arange(len(self.mbon_idx), dtype=np.int32)
+
+        keep_count = min(len(positive), max(4, int(math.ceil(len(positive) * 0.35))))
+        order = positive[np.argsort(drive[positive])[-keep_count:]]
+        return np.sort(order.astype(np.int32))
+
+    def _load_plasticity(self):
+        if not self.plasticity_path.exists() or len(self.mbon_idx) == 0:
+            self._rebuild_plastic_matrix()
+            return
+        try:
+            data = np.load(self.plasticity_path)
+            saved_mbon = data["mbon_body_ids"].astype(np.int64)
+            current_mbon = self.ids[self.mbon_idx]
+            if len(saved_mbon) != len(current_mbon) or not np.array_equal(saved_mbon, current_mbon):
+                print("[MaleCNS] Ignoring incompatible KC->MBON plasticity cache", file=sys.stderr, flush=True)
+                self._rebuild_plastic_matrix()
+                return
+
+            rows = data["rows"].astype(np.int32)
+            cols = data["cols"].astype(np.int32)
+            values = data["delta"].astype(np.float32)
+            valid = (rows >= 0) & (rows < len(self.mbon_idx)) & (cols >= 0) & (cols < self.n)
+            for r, c, v in zip(rows[valid], cols[valid], values[valid]):
+                if abs(float(v)) > 1e-9:
+                    self.plastic_changes[(int(r), int(c))] = float(v)
+            self._rebuild_plastic_matrix()
+        except Exception as exc:
+            print(f"[MaleCNS] Plasticity load warning: {exc}", file=sys.stderr, flush=True)
+            self.plastic_changes.clear()
+            self._rebuild_plastic_matrix()
+
+    def _save_plasticity(self):
+        if len(self.mbon_idx) == 0:
+            return
+        try:
+            if self.plastic_changes:
+                keys = list(self.plastic_changes.keys())
+                rows = np.fromiter((k[0] for k in keys), dtype=np.int32)
+                cols = np.fromiter((k[1] for k in keys), dtype=np.int32)
+                values = np.fromiter((self.plastic_changes[k] for k in keys), dtype=np.float32)
+            else:
+                rows = np.empty(0, np.int32)
+                cols = np.empty(0, np.int32)
+                values = np.empty(0, np.float32)
+            np.savez_compressed(
+                self.plasticity_path,
+                dataset=np.array(["male-cns:v1.0"]),
+                mbon_body_ids=self.ids[self.mbon_idx],
+                rows=rows,
+                cols=cols,
+                delta=values,
+            )
+        except Exception as exc:
+            print(f"[MaleCNS] Plasticity save warning: {exc}", file=sys.stderr, flush=True)
+
+    def _rebuild_plastic_matrix(self):
+        if len(self.mbon_idx) == 0 or not self.plastic_changes:
+            self.plastic_matrix = sparse.csr_matrix((len(self.mbon_idx), self.n), dtype=np.float32)
+            return
+        keys = list(self.plastic_changes.keys())
+        rows = np.fromiter((k[0] for k in keys), dtype=np.int32)
+        cols = np.fromiter((k[1] for k in keys), dtype=np.int32)
+        values = np.fromiter((self.plastic_changes[k] for k in keys), dtype=np.float32)
+        self.plastic_matrix = sparse.csr_matrix(
+            (values, (rows, cols)), shape=(len(self.mbon_idx), self.n), dtype=np.float32
+        )
+        self.plastic_matrix.sum_duplicates()
+
+    def _seed_eligibility_from_voltage(self):
+        if len(self.kc_idx) == 0:
+            return
+        current = self.kc_eligibility[self.kc_idx]
+        if np.any(current > self.ELIGIBILITY_MIN):
+            return
+        voltage = np.clip(self.v[self.kc_idx], 0.0, 1.0)
+        if not np.any(voltage > 0):
+            return
+        take = min(64, len(self.kc_idx))
+        if take <= 0:
+            return
+        local = np.argpartition(voltage, -take)[-take:]
+        chosen = self.kc_idx[local]
+        self.kc_eligibility[chosen] = np.maximum(self.kc_eligibility[chosen], voltage[local].astype(np.float32))
+
+    def _apply_plasticity(self, target_rows: np.ndarray, amount: float):
+        if amount <= 0 or len(target_rows) == 0 or self.kc_mbon_base.nnz == 0:
+            return
+
+        self._seed_eligibility_from_voltage()
+        changed = False
+        for row_index in target_rows:
+            row = self.kc_mbon_base.getrow(int(row_index))
+            if row.nnz == 0:
+                continue
+            cols = row.indices
+            base = row.data
+            eligibility = self.kc_eligibility[cols]
+            candidates = np.flatnonzero(eligibility > self.ELIGIBILITY_MIN)
+            if len(candidates) == 0:
+                continue
+
+            score = eligibility[candidates] * np.abs(base[candidates])
+            if len(candidates) > self.MAX_EDGES_PER_MBON_EVENT:
+                top = np.argpartition(score, -self.MAX_EDGES_PER_MBON_EVENT)[-self.MAX_EDGES_PER_MBON_EVENT:]
+                candidates = candidates[top]
+
+            for i in candidates:
+                col = int(cols[i])
+                base_weight = float(base[i])
+                if base_weight <= 0:
+                    continue
+                key = (int(row_index), col)
+                current = self.plastic_changes.get(key, 0.0)
+                step = float(self.LEARNING_RATE) * amount * float(eligibility[i]) * base_weight
+                floor = -float(self.MAX_DEPRESSION) * base_weight
+                updated = max(floor, current - step)
+                if abs(updated - current) > 1e-10:
+                    self.plastic_changes[key] = updated
+                    changed = True
+
+        if changed:
+            self._rebuild_plastic_matrix()
+            self._save_plasticity()
+
+    @property
+    def learned_synapses(self) -> int:
+        return len(self.plastic_changes)
+
+    @property
+    def plasticity_magnitude(self) -> float:
+        if not self.plastic_changes:
+            return 0.0
+        return float(sum(abs(v) for v in self.plastic_changes.values()))
+
     def reset(self):
         self.v.fill(0)
         self.spikes.fill(0)
+        self.kc_eligibility.fill(0)
         self.turn_ema = 0.0
         self.forward_ema = 0.0
         self.escape_ema = 0.0
@@ -134,10 +330,17 @@ class MaleCNSRuntime:
         self.punishment_pulse = 0.0
         self.pam_ema = 0.0
         self.ppl1_ema = 0.0
+        # Persistent KC->MBON deltas intentionally survive Reset and Play sessions.
 
     def reinforce(self, reward: float, punishment: float):
-        self.reward_pulse = max(self.reward_pulse, float(np.clip(reward, 0.0, 2.0)))
-        self.punishment_pulse = max(self.punishment_pulse, float(np.clip(punishment, 0.0, 2.0)))
+        reward = float(np.clip(reward, 0.0, 2.0))
+        punishment = float(np.clip(punishment, 0.0, 2.0))
+        self.reward_pulse = max(self.reward_pulse, reward)
+        self.punishment_pulse = max(self.punishment_pulse, punishment)
+        if reward > 0:
+            self._apply_plasticity(self.reward_mbon_rows, reward)
+        if punishment > 0:
+            self._apply_plasticity(self.punish_mbon_rows, punishment)
 
     def _stim(self, group: str, amount: float):
         if amount <= 0:
@@ -179,6 +382,10 @@ class MaleCNSRuntime:
             self.v *= self.DECAY
             self.v += syn + self.TONIC
 
+            if self.plastic_matrix.nnz:
+                learned_input = self.plastic_matrix.dot(self.spikes) * self.GAIN
+                self.v[self.mbon_idx] += learned_input
+
             noise_mask = self.rng.random(self.n) < self.noise_probability
             self.v[noise_mask] += self.noise_amplitude
 
@@ -186,13 +393,9 @@ class MaleCNSRuntime:
             if sensory is not None and len(sensory):
                 self.v[sensory] = 0.0
 
-            # Local optic/looming input only.
             self._stim("loom_L", 1.22 * left + 0.78 * front)
             self._stim("loom_R", 1.22 * right + 0.78 * front)
 
-            # target_bearing is not a route angle; Unity derives it from the difference between
-            # two local antenna/cue samples. This lateralized sensory signal is injected into the
-            # real receptor/projection populations.
             left_bias = max(0.0, -target_bearing)
             right_bias = max(0.0, target_bearing)
             center = 1.0 - abs(target_bearing)
@@ -203,11 +406,18 @@ class MaleCNSRuntime:
                 self._stim("goal_L", target_strength * (0.22 + 0.95 * left_bias + 0.18 * center))
                 self._stim("goal_R", target_strength * (0.22 + 0.95 * right_bias + 0.18 * center))
 
-            # Engineered reinforcement event delivered to identified dopamine neurons.
             self._stim("reward_dan", self.reward_pulse * 2.8)
             self._stim("punish_dan", self.punishment_pulse * 3.1)
 
             fired = np.flatnonzero(self.v >= self.THRESHOLD).astype(np.int32)
+
+            self.kc_eligibility *= self.ELIGIBILITY_DECAY
+            if len(fired) and len(self.kc_idx):
+                fired_kc = fired[self.kc_mask[fired]]
+                if len(fired_kc):
+                    self.kc_eligibility[fired_kc] = np.minimum(
+                        1.0, self.kc_eligibility[fired_kc] + np.float32(0.58)
+                    )
 
             low_l = max(self._group_rate("steer_low_L", fired), self._group_voltage("steer_low_L"))
             low_r = max(self._group_rate("steer_low_R", fired), self._group_voltage("steer_low_R"))
@@ -253,8 +463,12 @@ class MaleCNSRuntime:
 
         turn = float(np.tanh(self.turn_ema * 4.8))
         forward = float(np.clip(self.forward_ema * 2.0 + self.escape_ema * 0.16, 0.0, 1.0))
-        return (forward, turn, total_spikes, d02_l, d02_r, self.escape_ema,
-                d01_l, d01_r, fwd_l_out, fwd_r_out, max(pam, self.pam_ema), max(ppl1, self.ppl1_ema))
+        return (
+            forward, turn, total_spikes, d02_l, d02_r, self.escape_ema,
+            d01_l, d01_r, fwd_l_out, fwd_r_out,
+            max(pam, self.pam_ema), max(ppl1, self.ppl1_ema),
+            self.learned_synapses, self.plasticity_magnitude,
+        )
 
 
 def parse_command(line: str):
@@ -290,6 +504,7 @@ def main() -> int:
             if cmd is None:
                 continue
             if cmd[0] == "quit":
+                runtime._save_plasticity()
                 break
             if cmd[0] == "reset":
                 runtime.reset()
@@ -300,10 +515,12 @@ def main() -> int:
                 continue
 
             values = runtime.step_command(*cmd[1:])
-            forward, turn, spikes, d02_l, d02_r, escape, d01_l, d01_r, fwd_l, fwd_r, pam, ppl1 = values
+            (forward, turn, spikes, d02_l, d02_r, escape, d01_l, d01_r,
+             fwd_l, fwd_r, pam, ppl1, learned, magnitude) = values
             print(
                 f"M|{forward:.6f}|{turn:.6f}|{spikes}|{d02_l:.4f}|{d02_r:.4f}|{escape:.4f}|"
-                f"{d01_l:.4f}|{d01_r:.4f}|{fwd_l:.4f}|{fwd_r:.4f}|{pam:.4f}|{ppl1:.4f}",
+                f"{d01_l:.4f}|{d01_r:.4f}|{fwd_l:.4f}|{fwd_r:.4f}|{pam:.4f}|{ppl1:.4f}|"
+                f"{learned}|{magnitude:.6f}",
                 flush=True,
             )
         except Exception as exc:
