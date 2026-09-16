@@ -45,9 +45,12 @@ namespace FlyMaze
                 brainUi = gameObject.AddComponent<MaleCNSStatusUI>();
             brainUi.Initialize(brain, flyAgent);
 
-            // Turn the three major HUD surfaces into movable/collapsible desktop-like windows.
-            // The chrome is created after each UI has finished building so it can hide/show the
-            // existing content without requiring the individual HUD scripts to know about it.
+            // The old corner badge duplicated information already shown by the neural monitor.
+            // Hide it so every remaining functional HUD surface uses the same window interaction.
+            GameObject liveBadge = GameObject.Find("Live Badge");
+            if (liveBadge != null)
+                liveBadge.SetActive(false);
+
             HudWindowController.AttachNamed("Setup Panel", "MAP SETUP");
             HudWindowController.AttachNamed("Food Objective Bar", "FOOD OBJECTIVES");
             HudWindowController.AttachNamed("MaleCNS Neural Monitor", "MALECNS NEURAL MONITOR");
