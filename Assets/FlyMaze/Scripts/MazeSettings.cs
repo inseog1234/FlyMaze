@@ -8,9 +8,9 @@ namespace FlyMaze
     {
         [Range(5, 31)] public int width = 15;
         [Range(5, 25)] public int height = 11;
-        [Range(1.0f, 3.0f)] public float cellSize = 1.8f;
-        [Range(0f, 1f)] public float twistiness = 0.62f;
-        [Range(0f, 0.18f)] public float extraLoopChance = 0.035f;
+        [Range(1.4f, 4.0f)] public float cellSize = 2.6f;
+        [Range(0f, 1f)] public float twistiness = 0.42f;
+        [Range(0f, 0.18f)] public float extraLoopChance = 0.06f;
         public int seed = 0;
 
         public MazeSettings Clone()
@@ -22,7 +22,7 @@ namespace FlyMaze
         {
             width = Mathf.Clamp(width, 5, 31);
             height = Mathf.Clamp(height, 5, 25);
-            cellSize = Mathf.Clamp(cellSize, 1f, 3f);
+            cellSize = Mathf.Clamp(cellSize, 1.4f, 4.0f);
             twistiness = Mathf.Clamp01(twistiness);
             extraLoopChance = Mathf.Clamp(extraLoopChance, 0f, 0.18f);
         }
