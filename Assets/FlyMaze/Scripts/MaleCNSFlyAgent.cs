@@ -8,16 +8,23 @@ namespace FlyMaze
     public sealed class MaleCNSFlyAgent : MonoBehaviour
     {
         [Header("Movement")]
-        [SerializeField] private float moveSpeed = 2.2f;
-        [SerializeField] private float turnSpeed = 155f;
-        [SerializeField, Range(0f, 0.8f)] private float locomotorFloor = 0.28f;
+        [SerializeField] private float moveSpeed = 2.0f;
+        [SerializeField] private float turnSpeed = 220f;
+        [SerializeField, Range(0f, 0.8f)] private float locomotorFloor = 0.24f;
 
         [Header("Sensing")]
-        [SerializeField] private float obstacleRange = 2.3f;
+        [SerializeField] private float obstacleRange = 2.5f;
         [SerializeField] private float targetSenseFalloff = 0.075f;
         [SerializeField] private float sensorHeight = 0.34f;
 
+        [Header("Collision Recovery")]
+        [SerializeField] private float stuckDetectionSeconds = 0.28f;
+        [SerializeField] private float recoverySeconds = 0.72f;
+        [SerializeField] private float recoveryTurnSpeed = 300f;
+        [SerializeField] private float recoveryReverseSpeed = 1.35f;
+
         public bool Finished { get; private set; }
+        public bool RecoveryActive => _recoveryTimer > 0f;
         public Vector3 CurrentTarget { get; private set; }
         public int CurrentTargetKind { get; private set; } = -1;
 
@@ -30,6 +37,12 @@ namespace FlyMaze
         private Transform _rightWing;
         private float _wingPhase;
         private bool _initialized;
+
+        private float _stuckTimer;
+        private float _recoveryTimer;
+        private float _recoveryTurnSign = 1f;
+        private float _warmupUntil;
+        private Vector3 _lastFixedPosition;
 
         private Material _bodyMaterial;
         private Material _eyeMaterial;
@@ -54,7 +67,7 @@ namespace FlyMaze
             _body.constraints = RigidbodyConstraints.FreezePositionY | RigidbodyConstraints.FreezeRotationX | RigidbodyConstraints.FreezeRotationZ;
 
             SphereCollider collider = GetComponent<SphereCollider>();
-            collider.radius = 0.30f;
+            collider.radius = 0.27f;
             collider.center = new Vector3(0f, 0.32f, 0f);
 
             BuildVisual();
@@ -73,6 +86,8 @@ namespace FlyMaze
             Finished = false;
             _goal = null;
             CurrentTargetKind = -1;
+            _stuckTimer = 0f;
+            _recoveryTimer = 0f;
             if (_body != null)
                 _body.linearVelocity = Vector3.zero;
             _brain?.ResetNetwork();
@@ -89,18 +104,50 @@ namespace FlyMaze
             if (start != null)
             {
                 Vector3 spawn = start.position + Vector3.up * 0.32f;
-                transform.SetPositionAndRotation(spawn, Quaternion.identity);
+                Physics.SyncTransforms();
+                Quaternion heading = FindBestSpawnHeading(spawn);
+                transform.SetPositionAndRotation(spawn, heading);
                 if (_body != null)
                 {
                     _body.position = spawn;
-                    _body.rotation = Quaternion.identity;
+                    _body.rotation = heading;
                     _body.linearVelocity = Vector3.zero;
                     _body.angularVelocity = Vector3.zero;
                 }
+                _lastFixedPosition = spawn;
             }
 
+            _stuckTimer = 0f;
+            _recoveryTimer = 0f;
+            _warmupUntil = Time.fixedTime + 0.55f;
             Finished = false;
             _brain?.ResetNetwork();
+        }
+
+        private Quaternion FindBestSpawnHeading(Vector3 spawn)
+        {
+            Vector3[] directions = { Vector3.forward, Vector3.right, Vector3.back, Vector3.left };
+            Vector3 origin = spawn + Vector3.up * sensorHeight;
+            float bestDistance = -1f;
+            Vector3 best = Vector3.forward;
+
+            for (int i = 0; i < directions.Length; i++)
+            {
+                float distance = obstacleRange * 2.2f;
+                if (Physics.Raycast(origin, directions[i], out RaycastHit hit, distance, ~0, QueryTriggerInteraction.Ignore) &&
+                    hit.collider != null && hit.collider.gameObject.name == "Wall")
+                {
+                    distance = hit.distance;
+                }
+
+                if (distance > bestDistance)
+                {
+                    bestDistance = distance;
+                    best = directions[i];
+                }
+            }
+
+            return Quaternion.LookRotation(best, Vector3.up);
         }
 
         private void Update()
@@ -113,6 +160,11 @@ namespace FlyMaze
             if (!_initialized || _body == null || _brain == null || Finished)
                 return;
 
+            Vector3 delta = transform.position - _lastFixedPosition;
+            delta.y = 0f;
+            float movedThisStep = delta.magnitude;
+            _lastFixedPosition = transform.position;
+
             ResolveTarget(out Vector3 target, out int targetKind);
             CurrentTarget = target;
             CurrentTargetKind = targetKind;
@@ -121,10 +173,10 @@ namespace FlyMaze
             float front = SenseDirection(origin, transform.forward);
             float left = Mathf.Max(
                 SenseDirection(origin, Quaternion.Euler(0f, -25f, 0f) * transform.forward),
-                SenseDirection(origin, Quaternion.Euler(0f, -55f, 0f) * transform.forward));
+                SenseDirection(origin, Quaternion.Euler(0f, -58f, 0f) * transform.forward));
             float right = Mathf.Max(
                 SenseDirection(origin, Quaternion.Euler(0f, 25f, 0f) * transform.forward),
-                SenseDirection(origin, Quaternion.Euler(0f, 55f, 0f) * transform.forward));
+                SenseDirection(origin, Quaternion.Euler(0f, 58f, 0f) * transform.forward));
 
             float bearing = 0f;
             float strength = 0f;
@@ -142,18 +194,44 @@ namespace FlyMaze
 
             _brain.SubmitSensory(new MaleCNSSensoryFrame(front, left, right, bearing, strength, targetKind));
 
-            if (!_brain.IsReady)
+            if (!_brain.IsReady || Time.fixedTime < _warmupUntil)
             {
                 _body.linearVelocity = Vector3.zero;
+                return;
+            }
+
+            if (_recoveryTimer > 0f)
+            {
+                RunRecovery();
+                return;
+            }
+
+            // Only intervene after the connectome has physically failed to make progress into a wall.
+            // Normal navigation remains driven by MaleCNS outputs; this is a last-resort collision reflex.
+            bool pressedIntoWall = front > 0.58f && movedThisStep < 0.008f;
+            if (pressedIntoWall)
+                _stuckTimer += Time.fixedDeltaTime;
+            else
+                _stuckTimer = Mathf.Max(0f, _stuckTimer - Time.fixedDeltaTime * 2f);
+
+            if (_stuckTimer >= stuckDetectionSeconds)
+            {
+                BeginRecovery(left, right, bearing);
+                RunRecovery();
                 return;
             }
 
             float turn = _brain.TurnOutput;
             float speedDrive = Mathf.Lerp(locomotorFloor, 1f, _brain.ForwardOutput);
             if (_brain.EscapeOutput > 0.15f)
-                speedDrive = Mathf.Clamp01(speedDrive + _brain.EscapeOutput * 0.35f);
+                speedDrive = Mathf.Clamp01(speedDrive + _brain.EscapeOutput * 0.30f);
 
-            Quaternion rotation = Quaternion.Euler(0f, turn * turnSpeed * Time.fixedDeltaTime, 0f) * _body.rotation;
+            // Near a wall, give the actual connectome turn output more leverage and reduce forward shove.
+            float wallPressure = Mathf.Clamp01(front);
+            float effectiveTurnSpeed = Mathf.Lerp(turnSpeed, turnSpeed * 1.35f, wallPressure);
+            speedDrive *= Mathf.Lerp(1f, 0.46f, wallPressure);
+
+            Quaternion rotation = Quaternion.Euler(0f, turn * effectiveTurnSpeed * Time.fixedDeltaTime, 0f) * _body.rotation;
             _body.MoveRotation(rotation);
 
             Vector3 velocity = (rotation * Vector3.forward) * (moveSpeed * speedDrive);
@@ -166,6 +244,33 @@ namespace FlyMaze
                 _body.linearVelocity = Vector3.zero;
                 Debug.Log($"[FlyMaze] MaleCNS fly cleared the maze. Last brain tick: {_brain.LastSpikeCount:N0} spikes.");
             }
+        }
+
+        private void BeginRecovery(float leftObstacle, float rightObstacle, float targetBearing)
+        {
+            _stuckTimer = 0f;
+            _recoveryTimer = recoverySeconds;
+
+            if (leftObstacle > rightObstacle + 0.05f)
+                _recoveryTurnSign = 1f;
+            else if (rightObstacle > leftObstacle + 0.05f)
+                _recoveryTurnSign = -1f;
+            else if (Mathf.Abs(targetBearing) > 0.08f)
+                _recoveryTurnSign = Mathf.Sign(targetBearing);
+            else
+                _recoveryTurnSign = -_recoveryTurnSign;
+        }
+
+        private void RunRecovery()
+        {
+            _recoveryTimer = Mathf.Max(0f, _recoveryTimer - Time.fixedDeltaTime);
+            Quaternion rotation = Quaternion.Euler(0f, _recoveryTurnSign * recoveryTurnSpeed * Time.fixedDeltaTime, 0f) * _body.rotation;
+            _body.MoveRotation(rotation);
+
+            float reverseFactor = Mathf.Clamp01(_recoveryTimer / Mathf.Max(0.01f, recoverySeconds));
+            Vector3 velocity = -(rotation * Vector3.forward) * (recoveryReverseSpeed * Mathf.Lerp(0.35f, 1f, reverseFactor));
+            velocity.y = 0f;
+            _body.linearVelocity = velocity;
         }
 
         private void ResolveTarget(out Vector3 target, out int targetKind)
