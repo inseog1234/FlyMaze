@@ -74,9 +74,9 @@ namespace FlyMaze
             if (existing == null)
                 fly.transform.SetParent(transform, false);
 
-            // Give the neural controller enough physical room to turn and sample bilateral cues.
-            // Scaling the root also scales its collider and generated body/wing visuals together.
-            fly.transform.localScale = Vector3.one * 0.72f;
+            // Keep the physics/perception root at world scale 1. The visible fly is shrunk inside
+            // MaleCNSFlyAgent so ray lengths, antenna offsets, FOV mesh and collider math all agree.
+            fly.transform.localScale = Vector3.one;
 
             if (fly.GetComponent<Rigidbody>() == null)
                 fly.AddComponent<Rigidbody>();

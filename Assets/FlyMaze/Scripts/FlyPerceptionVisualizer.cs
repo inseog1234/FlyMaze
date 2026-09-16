@@ -53,12 +53,14 @@ namespace FlyMaze
             if (_fovMesh != null)
                 return;
 
-            Shader transparent = Shader.Find("Universal Render Pipeline/Unlit");
+            // Sprites/Default reliably honours alpha in URP without runtime blend-keyword setup.
+            // The previous URP Unlit material could render the cone nearly opaque on some setups.
+            Shader transparent = Shader.Find("Sprites/Default");
+            if (transparent == null) transparent = Shader.Find("Universal Render Pipeline/Unlit");
             if (transparent == null) transparent = Shader.Find("Unlit/Color");
-            if (transparent == null) transparent = Shader.Find("Sprites/Default");
 
             _fovMaterial = new Material(transparent) { name = "Fly FOV Material" };
-            Color fovColor = new Color(0.12f, 0.92f, 0.76f, 0.13f);
+            Color fovColor = new Color(0.12f, 0.92f, 0.76f, 0.075f);
             if (_fovMaterial.HasProperty("_BaseColor")) _fovMaterial.SetColor("_BaseColor", fovColor);
             if (_fovMaterial.HasProperty("_Color")) _fovMaterial.SetColor("_Color", fovColor);
             if (_fovMaterial.HasProperty("_Surface")) _fovMaterial.SetFloat("_Surface", 1f);
@@ -67,7 +69,7 @@ namespace FlyMaze
 
             GameObject fov = new GameObject("Vision Cone", typeof(MeshFilter), typeof(MeshRenderer));
             fov.transform.SetParent(transform, false);
-            fov.transform.localPosition = new Vector3(0f, 0.05f, 0f);
+            fov.transform.localPosition = new Vector3(0f, 0.06f, 0f);
             _fovMesh = new Mesh { name = "Fly Vision Cone Mesh" };
             fov.GetComponent<MeshFilter>().sharedMesh = _fovMesh;
             MeshRenderer meshRenderer = fov.GetComponent<MeshRenderer>();
@@ -75,19 +77,21 @@ namespace FlyMaze
             meshRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
             meshRenderer.receiveShadows = false;
 
-            _lineMaterial = new Material(Shader.Find("Sprites/Default")) { name = "Fly Sensor Line Material" };
+            Shader lineShader = Shader.Find("Sprites/Default");
+            if (lineShader == null) lineShader = Shader.Find("Unlit/Color");
+            _lineMaterial = new Material(lineShader) { name = "Fly Sensor Line Material" };
 
             GameObject outline = new GameObject("Vision Cone Outline", typeof(LineRenderer));
             outline.transform.SetParent(transform, false);
             _fovOutline = outline.GetComponent<LineRenderer>();
             _fovOutline.useWorldSpace = false;
             _fovOutline.loop = false;
-            _fovOutline.startWidth = 0.028f;
-            _fovOutline.endWidth = 0.028f;
+            _fovOutline.startWidth = 0.025f;
+            _fovOutline.endWidth = 0.025f;
             _fovOutline.sharedMaterial = _lineMaterial;
             _fovOutline.numCapVertices = 2;
             _fovOutline.numCornerVertices = 2;
-            Color outlineColor = new Color(0.26f, 1f, 0.86f, 0.72f);
+            Color outlineColor = new Color(0.26f, 1f, 0.86f, 0.65f);
             _fovOutline.startColor = outlineColor;
             _fovOutline.endColor = outlineColor;
 
@@ -129,7 +133,7 @@ namespace FlyMaze
             _outlinePoints.Clear();
             _outlinePoints.Add(Vector3.up * 0.02f);
 
-            Vector3 worldOrigin = transform.position + Vector3.up * 0.12f;
+            Vector3 worldOrigin = transform.position + Vector3.up * 0.26f;
             for (int i = 0; i <= segments; i++)
             {
                 float t = i / (float)segments;

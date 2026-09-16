@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -14,13 +15,13 @@ namespace FlyMaze
 
         [Header("Vision")]
         [SerializeField] private float obstacleRange = 2.8f;
-        [SerializeField] private float sensorHeight = 0.34f;
+        [SerializeField] private float sensorHeight = 0.26f;
 
         [Header("Olfaction")]
-        [SerializeField] private float antennaSeparation = 0.34f;
-        [SerializeField] private float antennaForward = 0.28f;
-        [SerializeField] private float smellDistanceFalloff = 0.19f;
-        [SerializeField, Range(0f, 1f)] private float wallScentTransmission = 0.34f;
+        [SerializeField] private float antennaSeparation = 0.52f;
+        [SerializeField] private float antennaForward = 0.30f;
+        [SerializeField, Range(0.1f, 0.9f)] private float corridorDiffusionFalloff = 0.52f;
+        [SerializeField, Range(0.5f, 2.0f)] private float localGradientGain = 1.25f;
 
         [Header("Reinforcement")]
         [SerializeField] private float stuckDetectionSeconds = 0.55f;
@@ -52,9 +53,24 @@ namespace FlyMaze
         private float _nextPunishmentTime;
         private Vector3 _lastFixedPosition;
 
+        private Transform _mazeRoot;
+        private int _gridWidth;
+        private int _gridHeight;
+        private float _gridCellSize;
+        private Vector3 _gridOriginLocal;
+        private byte[] _neighborMask;
+        private float[] _cueField;
+        private int _cueSignature = int.MinValue;
+        private int _cueKind = -1;
+
         private Material _bodyMaterial;
         private Material _eyeMaterial;
         private Material _wingMaterial;
+
+        private static readonly int[] GridDx = { 0, 1, 0, -1 };
+        private static readonly int[] GridDy = { 1, 0, -1, 0 };
+        private static readonly byte[] GridBit = { 1, 2, 4, 8 };
+        private static readonly int[] GridOpposite = { 2, 3, 0, 1 };
 
         public void Initialize(RandomMazeGenerator generator, FoodPlacementController foodPlacement, MaleCNSBridge brain)
         {
@@ -75,8 +91,8 @@ namespace FlyMaze
             _body.constraints = RigidbodyConstraints.FreezePositionY | RigidbodyConstraints.FreezeRotationX | RigidbodyConstraints.FreezeRotationZ;
 
             SphereCollider collider = GetComponent<SphereCollider>();
-            collider.radius = 0.26f;
-            collider.center = new Vector3(0f, 0.32f, 0f);
+            collider.radius = 0.19f;
+            collider.center = new Vector3(0f, 0.23f, 0f);
 
             BuildVisual();
 
@@ -102,19 +118,22 @@ namespace FlyMaze
             CurrentTarget = transform.position;
             _stuckTimer = 0f;
             _nextPunishmentTime = 0f;
+            InvalidateCueField();
             if (_body != null)
                 _body.linearVelocity = Vector3.zero;
             _brain?.ResetNetwork();
         }
 
-        private void HandleMazeBuilt(MazeBuildInfo _)
+        private void HandleMazeBuilt(MazeBuildInfo info)
         {
-            Transform maze = _generator != null ? _generator.transform.Find("Generated Maze") : null;
-            if (maze == null)
+            _mazeRoot = _generator != null ? _generator.transform.Find("Generated Maze") : null;
+            if (_mazeRoot == null)
                 return;
 
-            Transform start = maze.Find("START");
-            _goal = maze.Find("GOAL");
+            Transform start = _mazeRoot.Find("START");
+            _goal = _mazeRoot.Find("GOAL");
+            BuildMazeGraph(info);
+
             if (start != null)
             {
                 Vector3 spawn = start.position + Vector3.up * 0.32f;
@@ -187,18 +206,26 @@ namespace FlyMaze
             leftAntenna.y += sensorHeight;
             rightAntenna.y += sensorHeight;
 
-            bool hasFood = SampleFoodField(leftAntenna, rightAntenna, out float leftSignal, out float rightSignal, out Vector3 displayTarget);
+            FoodPickup[] foods = FindObjectsByType<FoodPickup>(FindObjectsSortMode.None);
+            bool hasFood = TryPrepareFoodCueField(foods, out Vector3 displayTarget);
             int targetKind;
+            float leftSignal;
+            float rightSignal;
+
             if (hasFood)
             {
                 targetKind = 0;
                 CurrentTarget = displayTarget;
+                leftSignal = SampleDiffusedCue(leftAntenna);
+                rightSignal = SampleDiffusedCue(rightAntenna);
             }
             else if (_goal != null)
             {
                 targetKind = 1;
-                SampleSingleCue(leftAntenna, rightAntenna, _goal.position + Vector3.up * sensorHeight, 0.26f, out leftSignal, out rightSignal);
                 CurrentTarget = _goal.position;
+                EnsureGoalCueField();
+                leftSignal = SampleDiffusedCue(leftAntenna);
+                rightSignal = SampleDiffusedCue(rightAntenna);
             }
             else
             {
@@ -212,15 +239,16 @@ namespace FlyMaze
             FoodSmellLeft = Mathf.Clamp01(leftSignal);
             FoodSmellRight = Mathf.Clamp01(rightSignal);
 
-            float totalSignal = Mathf.Clamp01((leftSignal + rightSignal) * 0.62f);
+            float totalSignal = Mathf.Clamp01((leftSignal + rightSignal) * 0.72f);
             float lateral = rightSignal - leftSignal;
-            float bearing = Mathf.Abs(leftSignal) + Mathf.Abs(rightSignal) > 0.0001f
-                ? Mathf.Clamp(lateral / (Mathf.Abs(leftSignal) + Mathf.Abs(rightSignal) + 0.0001f), -1f, 1f)
+            float sum = Mathf.Abs(leftSignal) + Mathf.Abs(rightSignal);
+            float bearing = sum > 0.0001f
+                ? Mathf.Clamp((lateral / (sum + 0.0001f)) * 1.8f, -1f, 1f)
                 : 0f;
 
-            // Important: this is the whole navigation input. No A*, BFS, waypoint, target-vector
-            // steering, or scripted obstacle turn is mixed into the motor command. Unity only turns
-            // the environment into local visual/olfactory sensory signals.
+            // No route/waypoint is sent to the motor controller. The maze graph below is used only
+            // to model an odor/cue field diffusing through open corridors. The fly receives the
+            // concentration sampled at its two antennae, then MaleCNS decides the motor output.
             _brain.SubmitSensory(new MaleCNSSensoryFrame(VisionFront, VisionLeft, VisionRight, bearing, totalSignal, targetKind));
 
             if (!_brain.IsReady || Time.fixedTime < _warmupUntil)
@@ -242,7 +270,6 @@ namespace FlyMaze
                 _stuckTimer = 0f;
             }
 
-            // Motor behavior is decoded only from MaleCNS descending-neuron activity.
             float turn = _brain.TurnOutput;
             float speedDrive = Mathf.Lerp(locomotorFloor, 1f, _brain.ForwardOutput);
             Quaternion rotation = Quaternion.Euler(0f, turn * turnSpeed * Time.fixedDeltaTime, 0f) * _body.rotation;
@@ -257,18 +284,61 @@ namespace FlyMaze
                 Finished = true;
                 _body.linearVelocity = Vector3.zero;
                 _brain.GiveReward(goalReward);
-                Debug.Log($"[FlyMaze] MaleCNS fly cleared the maze with sensory-only control. Last brain tick: {_brain.LastSpikeCount:N0} spikes.");
+                Debug.Log($"[FlyMaze] MaleCNS fly cleared the maze with sensory-only control. Last brain tick: {_brain.LastSpikeCount:N,0} spikes.");
             }
         }
 
-        private bool SampleFoodField(Vector3 leftAntenna, Vector3 rightAntenna, out float leftSignal, out float rightSignal, out Vector3 displayTarget)
+        private void BuildMazeGraph(MazeBuildInfo info)
         {
-            leftSignal = 0f;
-            rightSignal = 0f;
-            displayTarget = transform.position;
+            InvalidateCueField();
+            _gridWidth = Mathf.Max(1, info.Width);
+            _gridHeight = Mathf.Max(1, info.Height);
 
-            FoodPickup[] foods = FindObjectsByType<FoodPickup>(FindObjectsSortMode.None);
-            bool found = false;
+            Transform floor = _mazeRoot != null ? _mazeRoot.Find("Maze Floor") : null;
+            if (floor != null)
+                _gridCellSize = Mathf.Max(0.5f, (floor.localScale.x - 0.9f) / _gridWidth);
+            else
+                _gridCellSize = 2.6f;
+
+            _gridOriginLocal = new Vector3(
+                -(_gridWidth - 1) * 0.5f * _gridCellSize,
+                0f,
+                -(_gridHeight - 1) * 0.5f * _gridCellSize);
+
+            _neighborMask = new byte[_gridWidth * _gridHeight];
+            Physics.SyncTransforms();
+
+            for (int y = 0; y < _gridHeight; y++)
+            for (int x = 0; x < _gridWidth; x++)
+            {
+                int index = GridIndex(x, y);
+                Vector3 center = GridCellWorld(x, y) + Vector3.up * sensorHeight;
+
+                for (int dir = 0; dir < 2; dir++)
+                {
+                    int nx = x + GridDx[dir];
+                    int ny = y + GridDy[dir];
+                    if (!GridInBounds(nx, ny))
+                        continue;
+
+                    Vector3 other = GridCellWorld(nx, ny) + Vector3.up * sensorHeight;
+                    if (WallBlocksSegment(center, other))
+                        continue;
+
+                    _neighborMask[index] |= GridBit[dir];
+                    _neighborMask[GridIndex(nx, ny)] |= GridBit[GridOpposite[dir]];
+                }
+            }
+        }
+
+        private bool TryPrepareFoodCueField(FoodPickup[] foods, out Vector3 displayTarget)
+        {
+            displayTarget = transform.position;
+            if (_neighborMask == null || foods == null)
+                return false;
+
+            List<Vector2Int> sources = new List<Vector2Int>(foods.Length);
+            int signature = 17;
             float nearestSqr = float.PositiveInfinity;
 
             for (int i = 0; i < foods.Length; i++)
@@ -277,11 +347,10 @@ namespace FlyMaze
                 if (food == null || food.IsCollected)
                     continue;
 
-                found = true;
-                Vector3 source = food.transform.position + Vector3.up * sensorHeight;
-                leftSignal += SampleScent(leftAntenna, source);
-                rightSignal += SampleScent(rightAntenna, source);
+                if (TryWorldToCell(food.transform.position, out int x, out int y))
+                    sources.Add(new Vector2Int(x, y));
 
+                signature = unchecked(signature * 31 + food.GetInstanceID());
                 float sqr = (food.transform.position - transform.position).sqrMagnitude;
                 if (sqr < nearestSqr)
                 {
@@ -290,34 +359,151 @@ namespace FlyMaze
                 }
             }
 
-            leftSignal = Mathf.Clamp01(leftSignal);
-            rightSignal = Mathf.Clamp01(rightSignal);
-            return found;
+            if (sources.Count == 0)
+                return false;
+
+            signature = unchecked(signature * 31 + sources.Count);
+            if (_cueField == null || _cueKind != 0 || _cueSignature != signature)
+            {
+                BuildDiffusionField(sources);
+                _cueKind = 0;
+                _cueSignature = signature;
+            }
+
+            return true;
         }
 
-        private float SampleScent(Vector3 samplePoint, Vector3 source)
+        private void EnsureGoalCueField()
         {
-            float distance = Vector3.Distance(samplePoint, source);
-            float intensity = 1f / (1f + distance * distance * smellDistanceFalloff);
-            if (WallBlocksSegment(samplePoint, source))
-                intensity *= wallScentTransmission;
-            return intensity;
+             if (_goal == null || _neighborMask == null)
+                return;
+            if (!TryWorldToCell(_goal.position, out int x, out int y))
+                return;
+
+            int signature = unchecked(991 * 31 + GridIndex(x, y));
+            if (_cueField != null && _cueKind == 1 && _cueSignature == signature)
+                return;
+
+            BuildDiffusionField(new List<Vector2Int> { new Vector2Int(x, y) });
+            _cueKind = 1;
+            _cueSignature = signature;
         }
 
-        private void SampleSingleCue(Vector3 leftSample, Vector3 rightSample, Vector3 source, float falloff,
-            out float leftSignal, out float rightSignal)
+        private void BuildDiffusionField(List<Vector2Int> sources)
         {
-            leftSignal = CueIntensity(leftSample, source, falloff);
-            rightSignal = CueIntensity(rightSample, source, falloff);
+            int count = _gridWidth * _gridHeight;
+            int[] distance = new int[count];
+            for (int i = 0; i < count; i++)
+                distance[i] = int.MaxValue;
+
+            Queue<int> queue = new Queue<int>(count);
+            for (int i = 0; i < sources.Count; i++)
+            {
+                int source = GridIndex(sources[i].x, sources[i].y);
+                if (distance[source] == 0)
+                    continue;
+                distance[source] = 0;
+                queue.Enqueue(source);
+            }
+
+            while (queue.Count > 0)
+            {
+                int current = queuee.Dequeue();
+                int cx = current % _gridWidth;
+                int cy = current / _gridWidth;
+                int nextDistance = distance[current] + 1;
+                byte open = _neighborMask[current];
+
+                for (int dir = 0; dir < 4; dir++)
+                {
+                    if ((open & GridBit[dir]) == 0)
+                        continue;
+                    int nx = cx + GridDx[dir];
+                    int ny = cy + GridDy[dir];
+                    if (!GridInBounds(nx, ny))
+                        continue;
+                    int next = GridIndex(nx, ny);
+                    if (distance[next] <= nextDistance)
+                        continue;
+                    distance[next] = nextDistance;
+                    queue.Enqueue(next);
+                }
+            }
+
+            _cueField = new float[count];
+            for (int i = 0; i < count; i++)
+            {
+                if (distance[i] == int.MaxValue)
+                    _cueField[i] = 0f;
+                else
+                    _cueField[i] = Mathf.Exp(-distance[i] * corridorDiffusionFalloff);
+            }
         }
 
-        private float CueIntensity(Vector3 samplePoint, Vector3 source, float falloff)
+        private float SampleDiffusedCue(Vector3 worldPoint)
         {
-            float distance = Vector3.Distance(samplePoint, source);
-            float intensity = 1f / (1f + distance * distance * falloff);
-            if (WallBlocksSegment(samplePoint, source))
-                intensity *= 0.18f;
-            return Mathf.Clamp01(intensity);
+             if (_cueField == null || _neighborMask == null || !TryWorldToCell(worldPoint, out int x, out int y))
+                return 0f;
+
+            int index = GridIndex(x, y);
+            float center = _cueField[index];
+            byte open = _neighborMask[index];
+
+            float north = NeighborCueOrCenter(x, y, 0, center, open);
+            float east = NeighborCueOrCenter(x, y, 1, center, open);
+            float south = NeighborCueOrCenter(x, y, 2, center, open);
+            float west = NeighborCueOrCenter(x, y, 3, center, open);
+
+            Vector3 local = _mazeRoot.InverseTransformPoint(worldPoint);
+            Vector3 cellCenter = _gridOriginLocal + new Vector3(x * _gridCellSize, 0f, y * _gridCellSize);
+            float localX = Mathf.Clamp((local.x - cellCenter.x) / (_gridCellSize * 0.5f), -1f, 1f);
+            float localZ = Mathf.Clamp((local.z - cellCenter.z) / (_gridCellSize * 0.5f), -1f, 1f);
+
+            float gradientX = (east - west) * 0.5f;
+            float gradientZ = (north - south) * 0.5f;
+            float value = center + (gradientX * localX + gradientZ * localZ) * localGradientGain;
+            return Mathf.Clamp01(value);
+        }
+
+        private float NeighborCueOrCenter(int x, int y, int dir, float center, byte open)
+        {
+            if ((open & GridBit[dir]) == 0)
+                return center;
+            int nx = x + GridDx[dir];
+             int ny = y + GridDy[dir];
+            if (!GridInBounds(nx, ny))
+                return center;
+            return _cueField[GridIndex(nx, ny)];
+        }
+
+        private bool TryWorldToCell(Vector3 world, out int x, out int y)
+        {
+            x = y = 0;
+            if (_mazeRoot == null || _gridCellSize <= 0f || _gridWidth <= 0 || _gridHeight <= 0)
+                return false;
+
+            Vector3 local = _mazeRoot.InverseTransformPoint(world);
+            x = Mathf.RoundToInt((local.x - _gridOriginLocal.x) / _gridCellSize);
+            y = Mathf.RoundToInt((local.z - _gridOriginLocal.z) / _gridCellSize);
+            x = Mathf.Clamp(x, 0, _gridWidth - 1);
+            y = Mathf.Clamp(y, 0, _gridHeight - 1);
+            return true;
+        }
+
+        private Vector3 GridCellWorld(int x, int y)
+        {
+            Vector3 local = _gridOriginLocal + new Vector3(x * _gridCellSize, 0f, y * _gridCellSize);
+            return _mazeRoot != null ? _mazeRoot.TransformPoint(local) : local;
+        }
+
+        private int GridIndex(int x, int y) => y * _gridWidth + x;
+        private bool GridInBounds(int x, int y) => x >= 0 && y >= 0 && x < _gridWidth && y < _gridHeight;
+
+        private void InvalidateCueField()
+        {
+            _cueField = null;
+            _cueSignature = int.MinValue;
+            _cueKind = -1;
         }
 
         private bool WallBlocksSegment(Vector3 from, Vector3 to)
@@ -330,7 +516,8 @@ namespace FlyMaze
             RaycastHit[] hits = Physics.RaycastAll(from, delta / distance, distance, ~0, QueryTriggerInteraction.Ignore);
             for (int i = 0; i < hits.Length; i++)
             {
-                if (hits[i].collider != null && hits[i].collider.gameObject.name == "Wall")
+                Collider collider = hits[i].collider;
+                if (collider != null && collider.gameObject.name == "Wall")
                     return true;
             }
             return false;
@@ -363,6 +550,7 @@ namespace FlyMaze
                 return;
 
             food.Collect();
+            InvalidateCueField();
             _brain?.GiveReward(foodReward);
         }
 
@@ -374,9 +562,10 @@ namespace FlyMaze
 
             GameObject visual = new GameObject("Fly Visual");
             visual.transform.SetParent(transform, false);
-            visual.transform.localPosition = new Vector3(0f, 0.34f, 0f);
+            visual.transform.localPosition = new Vector3(0f, 0.245f, 0f);
+            visual.transform.localScale = Vector3.one * 0.72f;
 
-            CreatePrimitive(PrimitiveType.Sphere, "Thorax", visual.transform, new Vector3(0f, 0f, 0f), new Vector3(0.42f, 0.28f, 0.56f), _bodyMaterial);
+            CreatePrimitive(PrimitiveType.Sphere, "Thorax", visual.transform, Vector3.zero, new Vector3(0.42f, 0.28f, 0.56f), _bodyMaterial);
             CreatePrimitive(PrimitiveType.Sphere, "Abdomen", visual.transform, new Vector3(0f, -0.01f, -0.28f), new Vector3(0.34f, 0.24f, 0.52f), _bodyMaterial);
             CreatePrimitive(PrimitiveType.Sphere, "Head", visual.transform, new Vector3(0f, 0.02f, 0.30f), new Vector3(0.34f, 0.28f, 0.30f), _bodyMaterial);
             CreatePrimitive(PrimitiveType.Sphere, "Eye L", visual.transform, new Vector3(-0.16f, 0.055f, 0.39f), new Vector3(0.14f, 0.16f, 0.09f), _eyeMaterial);
@@ -430,7 +619,7 @@ namespace FlyMaze
 
             Material material = new Material(shader) { name = name };
             if (material.HasProperty("_BaseColor")) material.SetColor("_BaseColor", baseColor);
-            if (material.HasProperty("_Color")) material.SetColor("_Color", baseColor);
+            if (material.HasProperty("_Color")) material.SetRColor("_Color", baseColor);
             if (material.HasProperty("_EmissionColor"))
             {
                 material.SetColor("_EmissionColor", emission);
@@ -442,33 +631,4 @@ namespace FlyMaze
         private static Material MakeTransparentMaterial(string name, Color color)
         {
             Shader shader = Shader.Find("Universal Render Pipeline/Unlit");
-            if (shader == null) shader = Shader.Find("Unlit/Color");
-            Material material = new Material(shader) { name = name };
-            if (material.HasProperty("_BaseColor")) material.SetColor("_BaseColor", color);
-            if (material.HasProperty("_Color")) material.SetColor("_Color", color);
-            if (material.HasProperty("_Surface")) material.SetFloat("_Surface", 1f);
-            if (material.HasProperty("_ZWrite")) material.SetFloat("_ZWrite", 0f);
-            material.renderQueue = 3000;
-            return material;
-        }
-
-        private void OnDestroy()
-        {
-            if (_generator != null)
-            {
-                _generator.GenerationStarted -= HandleGenerationStarted;
-                _generator.MazeBuilt -= HandleMazeBuilt;
-            }
-
-            DestroyMaterial(_bodyMaterial);
-            DestroyMaterial(_eyeMaterial);
-            DestroyMaterial(_wingMaterial);
-        }
-
-        private static void DestroyMaterial(Material material)
-        {
-            if (material != null)
-                Destroy(material);
-        }
-    }
-}
+            if (shader == null¤Í¡…‘•È€ôM¡…‘•È¹¥¹ ‰U¹±¥Ð½½±½Èˆ¤ì(€€€€€€€€€€€5…Ñ•É¥…°µ…Ñ•É¥…°€ô¹•Ü5…Ñ•É¥…°¡Í¡…‘•È¤ì¹…µ”€ô¹…µ”ôì(€€€€€€€€€€€¥˜€¡µ…Ñ•É¥…°¹!…ÍAÉ½Á•ÉÑä ‰}	…Í•½±½Èˆ¤¤µ…Ñ•É¥…°¹M•ÑI½±½È ‰}	…Í•½±½Èˆ°½±½È¤ì(€€€€€€€€€€€¥˜€¡µ…Ñ•É¥…°¹!…ÍAÉ½Á•ÉÑä ‰}½±½Èˆ¤¤µ…Ñ•É¥…°¹M•Ñ½±½È ‰}½±½Èˆ°½±½È¤ì(€€€€€€€€€€€¥˜€¡µ…Ñ•É¥…°¹!…ÍAÉ½Á•ÉÑä ‰}MÕÉ™…”ˆ¤¤µ…Ñ•É¥…°¹M•Ñ±½…Ð ‰}MÕÉ™…”ˆ°€Å˜¤ì(€€€€€€€€€€€¥˜€¡µ…Ñ•É¥…°¹!…ÍAÉ½Á•ÉÑä ‰}i]É¥Ñ”ˆ¤¤µ…Ñ•É¥…°¹M•Ñ±½…Ð ‰}i]É¥Ñ”ˆ°€Á˜¤ì(€€€€€€€€€€€µ…Ñ•É¥…°¹É•¹‘•ÉEÕ•Õ”€ô€ÌÀÀÀì(€€€€€€€€€€€É•ÑÕÉ¸µ…Ñ•É¥…°ì(€€€€€€€ô((€€€€€€€ÁÉ¥Ù…Ñ”Ù½¥=¹•ÍÑÉ½ä ¤(€€€€€€€ì(€€€€€€€€€€€¥˜€¡}•¹•É…Ñ½È€„ô¹Õ±°¤(€€€€€€€€€€€ì(€€€€€€€€€€€€€€€}•¹•É…Ñ½È¹•¹•É…Ñ¥½¹MÑ…ÉÑ•€´ô!…¹‘±••¹•É…Ñ¥½¹MÑ…ÉÑ•ì(€€€€€€€€€€€€€€€}•¹•É…Ñ½È¹5…é•	Õ¥±Ð€´ô!…¹‘±•5…é•	Õ¥±Ðì(€€€€€€€€€€€ô((€€€€€€€€€€€•ÍÑÉ½å5…Ñ•É¥…°¡}‰½‘å5…Ñ•É¥…°¤ì(€€€€€€€€€€€•ÍÑÉ½å5…Ñ•É¥…°¡}•å•5…Ñ•É¥…°¤ì(€€€€€€€€€€€•ÍÑÉ½å5…Ñ•É¥…°¡}Ý¥¹5…Ñ•É¥…°¤ì(€€€€€€€ô((€€€€€€€ÁÉ¥Ù…Ñ”ÍÑ…Ñ¥ŒÙ½¥•ÍÑÉ½å5…Ñ•É¥…°¡5…Ñ•É¥…°µ…Ñ•É¥…°¤(€€€€€€€ì(€€€€€€€€€€€¥˜€¡µ…Ñ•É¥…°€„ô¹Õ±°¤(€€€€€€€€€€€€€€€•ÍÑÉ½ä¡µ…Ñ•É¥…°¤ì(€€€€€€€ô(€€€ô)ô(
