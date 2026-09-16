@@ -9,7 +9,8 @@ namespace FlyMaze
     public sealed class MazeCameraController : MonoBehaviour
     {
         [Header("Zoom")]
-        [SerializeField] private float zoomSpeed = 0.0032f;
+        [Tooltip("Orthographic-size multiplier for one mouse-wheel notch. 0.50 means one notch zooms twice as fast as before.")]
+        [SerializeField, Range(0.25f, 0.90f)] private float zoomPerNotch = 0.50f;
         [SerializeField] private float minOrthographicSize = 2.5f;
         [SerializeField] private float maxOrthographicSize = 90f;
 
@@ -139,7 +140,13 @@ namespace FlyMaze
         {
             bool hasBefore = TryGetGroundPoint(screenPosition, out Vector3 before);
 
-            float factor = Mathf.Exp(-scrollDelta * zoomSpeed);
+            // Input System commonly reports +/-120 per physical wheel notch on Windows, while
+            // some mice/touchpads report +/-1-ish values. Normalize both forms so sensitivity is
+            // predictable, then deliberately use a much stronger ~2x zoom per notch.
+            float notches = Mathf.Abs(scrollDelta) >= 10f ? scrollDelta / 120f : scrollDelta;
+            notches = Mathf.Clamp(notches, -3f, 3f);
+
+            float factor = Mathf.Pow(zoomPerNotch, notches);
             _camera.orthographicSize = Mathf.Clamp(
                 _camera.orthographicSize * factor,
                 minOrthographicSize,
