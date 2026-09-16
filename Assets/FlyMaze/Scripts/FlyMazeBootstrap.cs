@@ -14,16 +14,26 @@ namespace FlyMaze
             if (generator == null)
                 generator = gameObject.AddComponent<RandomMazeGenerator>();
 
+            FoodPlacementController foodPlacement = GetComponent<FoodPlacementController>();
+            if (foodPlacement == null)
+                foodPlacement = gameObject.AddComponent<FoodPlacementController>();
+            foodPlacement.Bind(generator, camera);
+
             MazeCameraController cameraController = camera.GetComponent<MazeCameraController>();
             if (cameraController == null)
                 cameraController = camera.gameObject.AddComponent<MazeCameraController>();
-            cameraController.Bind(generator);
+            cameraController.Bind(generator, foodPlacement);
 
             MazeSetupUI ui = GetComponent<MazeSetupUI>();
             if (ui == null)
                 ui = gameObject.AddComponent<MazeSetupUI>();
-
             ui.Initialize(generator);
+
+            FoodPlacementUI foodUi = GetComponent<FoodPlacementUI>();
+            if (foodUi == null)
+                foodUi = gameObject.AddComponent<FoodPlacementUI>();
+            foodUi.Initialize(foodPlacement);
+
             HudTextQuality.Apply(transform);
         }
 
